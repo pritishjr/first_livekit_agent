@@ -1,5 +1,6 @@
 import logging
 import textwrap
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -11,7 +12,12 @@ from livekit.agents import (
     cli,
     inference,
     room_io,
+    get_job_context,
+    RunContext,
+    AgentTask,
+    function_tool,
 )
+from livekit.agents.beta.workflows import TaskGroup #for multi-task-agent workflows
 from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -19,7 +25,94 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
+#defining tasks as dataclasses. (since they are usable)
+@dataclass 
+class Email: #backend to accept the email-address via AgentTask
+    email: str
 
+@dataclass
+class ShippingAddress: #similar to accepting email.
+    address: str
+
+class GetEmail(AgentTask[Email]):
+    def __init__(self) -> None:
+        super().__init__(
+            instructions="""
+                Collect the user's email address.
+                Use the get_the_email function to get the email from the user.
+                Be polite and professional.
+            """
+        )
+    
+    @function_tool
+    async def on_entry(self) -> None:
+        await self.session.generate_reply(
+            instructions="""
+                Briefly introduce yourself and get the email address from the user. Make it clear that it is mandatory.
+            """
+        )
+        
+    @function_tool
+    async def get_the_email(self, context: RunContext, email:str) -> None:
+        #tool docstring:
+        """Collect the user's email address."""
+        self.complete(Email(email=email))
+        
+class GetShippingAdress(AgentTask[ShippingAddress]):
+    def __init__(self) -> None:
+        super().__init__(
+            instructions="""
+                Collect the user's shipping address.
+                Use get_the_shipping_address function tool to get the user's shipping address.
+            """
+        )
+
+    @function_tool
+    async def on_entry(self) -> None:
+        await self.session.generate_reply(
+            instructions="""
+                Thank them for their cooperation.
+                Proceed in getting their shipping address.
+            """
+        )
+        
+    @function_tool
+    async def get_the_shipping_address(
+        self,
+        context: RunContext, #usually not reqd
+        address: str
+    ) -> None:
+
+        #tool docstring:
+        """Collect the user's shipping address"""
+        self.complete(ShippingAddress(address=address))
+        
+#now we need an Agent that can handle these tasks "sequentially" using taskgroups - in a manner of WORKFLOW iykyk
+class CheckOutAgent(Agent):
+    
+    async def on_entry(self,email: str) -> None:
+        task_group = TaskGroup()
+        
+        task_group.add( 
+            lambda: GetEmail(),
+            id = "email",
+            description="Collecting the user's email address."
+        )
+        task_group.add(
+            lambda: GetShippingAdress(),
+            id= "address",
+            description="Collecting the user's shipping address."
+        )
+        
+        results = await task_group
+        
+        #extracting the results:
+        email_address = results.task_results["email"].email
+        shipping_address = results.task_results["address"].address
+        
+        await self.session.generate_reply(
+            instructions=f"Confirm the email as {email_address} and the shipping address as {shipping_address}"
+        )
 
 class Assistant(Agent):
     def __init__(self) -> None:
