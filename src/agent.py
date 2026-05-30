@@ -88,32 +88,6 @@ class GetShippingAdress(AgentTask[ShippingAddress]):
         self.complete(ShippingAddress(address=address))
         
 #now we need an Agent that can handle these tasks "sequentially" using taskgroups - in a manner of WORKFLOW iykyk
-class CheckOutAgent(Agent):
-    
-    async def on_entry(self,email: str) -> None:
-        task_group = TaskGroup()
-        
-        task_group.add( 
-            lambda: GetEmail(),
-            id = "email",
-            description="Collecting the user's email address."
-        )
-        task_group.add(
-            lambda: GetShippingAdress(),
-            id= "address",
-            description="Collecting the user's shipping address."
-        )
-        
-        results = await task_group
-        
-        #extracting the results:
-        email_address = results.task_results["email"].email
-        shipping_address = results.task_results["address"].address
-        
-        await self.session.generate_reply(
-            instructions=f"Confirm the email as {email_address} and the shipping address as {shipping_address}"
-        )
-
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
@@ -164,23 +138,31 @@ class Assistant(Agent):
                 """
             ),
         )
-
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+        
+    @function_tool
+    async def on_entry(self,email: str) -> None:
+        task_group = TaskGroup()
+        
+        task_group.add( 
+            lambda: GetEmail(),
+            id = "email",
+            description="Collecting the user's email address."
+        )
+        task_group.add(
+            lambda: GetShippingAdress(),
+            id= "address",
+            description="Collecting the user's shipping address."
+        )
+        
+        results = await task_group
+        
+        #extracting the results:
+        email_address = results.task_results["email"].email
+        shipping_address = results.task_results["address"].address
+        
+        await self.session.generate_reply(
+            instructions=f"Confirm the email as {email_address} and the shipping address as {shipping_address}"
+        )
 
 
 server = AgentServer()
