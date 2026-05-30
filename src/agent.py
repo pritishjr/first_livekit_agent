@@ -12,12 +12,10 @@ from livekit.agents import (
     cli,
     inference,
     room_io,
-    get_job_context,
-    RunContext,
     AgentTask,
     function_tool,
 )
-from livekit.agents.beta.workflows import TaskGroup #for multi-task-agent workflows
+from livekit.agents.beta.workflows import TaskGroup, TaskCompletedEvent #for multi-task-agent workflows
 from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -31,44 +29,46 @@ class Email: #backend to accept the email-address via AgentTask
     email: str
 
 @dataclass
-class ShippingAddress: #similar to accepting email.
+class ShippingAddress:
     address: str
+    
+@dataclass
+class Confirmation:
+    confirmed: bool
 
 class GetEmail(AgentTask[Email]):
     def __init__(self) -> None:
         super().__init__(
             instructions="""
                 Collect the user's email address.
-                Use the get_the_email function to get the email from the user.
+                Use the get_the_email function tool to get the email from the user.
                 Be polite and professional.
             """
         )
     
-    @function_tool
-    async def on_entry(self) -> None:
+    async def on_enter(self) -> None:
         await self.session.generate_reply(
             instructions="""
-                Briefly introduce yourself and get the email address from the user. Make it clear that it is mandatory.
+                Collect the user's email address from the user. Make it clear that it is mandatory.
             """
         )
         
     @function_tool
-    async def get_the_email(self, context: RunContext, email:str) -> None:
+    async def get_the_email(self, email:str) -> None:
         #tool docstring:
         """Collect the user's email address."""
         self.complete(Email(email=email))
         
-class GetShippingAdress(AgentTask[ShippingAddress]):
+class GetShippingAddress(AgentTask[ShippingAddress]):
     def __init__(self) -> None:
         super().__init__(
             instructions="""
                 Collect the user's shipping address.
-                Use get_the_shipping_address function tool to get the user's shipping address.
+                Use the function tool get_the_shipping_address to get the user's shipping address.
             """
         )
 
-    @function_tool
-    async def on_entry(self) -> None:
+    async def on_enter(self) -> None:
         await self.session.generate_reply(
             instructions="""
                 Thank them for their cooperation.
@@ -79,7 +79,6 @@ class GetShippingAdress(AgentTask[ShippingAddress]):
     @function_tool
     async def get_the_shipping_address(
         self,
-        context: RunContext, #usually not reqd
         address: str
     ) -> None:
 
@@ -87,13 +86,79 @@ class GetShippingAdress(AgentTask[ShippingAddress]):
         """Collect the user's shipping address"""
         self.complete(ShippingAddress(address=address))
         
+#adding the consent approval:
+class ConsentApproval(AgentTask[bool]):
+    def __init__(self, chat_ctx=None) -> None:
+        super().__init__(
+            instructions="""
+                Be polite and professional.
+                Use the function tool yes_agreement if the consent from the user was given, and the function tool no_agreement if the consent from the the user was denied.
+            """,
+            chat_ctx=chat_ctx,
+
+        )
+        
+    async def on_enter(self) -> None:
+        await self.session.generate_reply(
+            instructions="""
+                Ask for the user's approval to record the call for training and quality purposes. 
+            """
+        )
+        
+    @function_tool
+    async def yes_agreement(self) -> None:
+        #tool docstring:
+        """If the consent has been approved."""
+        self.complete(True)
+        
+    @function_tool
+    async def no_agreement(self) -> None:
+        #tool docstring:
+        """If the consent has been declined."""
+        self.complete(False)
+
+#adding a class which allows the agent to confirm the contact details it just accepted from the user.
+class ConfirmContactInfo(AgentTask[Confirmation]):
+    def __init__(self, email: str, address: str, chat_ctx=None) -> None:
+        self._email = email
+        self._address = address
+        super().__init__(
+            instructions="""
+                Confirm the user's email and shipping address.
+                Spell out the email address character by character.
+                Ask for a clear yes or no answer.
+                Use the function tool confirm_yes if the user confirms.
+                Use the function tool confirm_no if the user wants to correct the details.
+            """,
+            chat_ctx=chat_ctx,
+        )
+
+    async def on_enter(self) -> None:
+        await self.session.generate_reply(
+            instructions=(
+                f"Please confirm your email and shipping address. "
+                f"Email: {self._email}. Shipping address: {self._address}. "
+                "Is that correct?"
+            )
+        )
+
+    @function_tool
+    async def confirm_yes(self) -> None:
+        """Use this when the user confirms the details."""
+        self.complete(Confirmation(confirmed=True))
+
+    @function_tool
+    async def confirm_no(self) -> None:
+        """Use this when the user wants to correct the details."""
+        self.complete(Confirmation(confirmed=False))
+        
 #now we need an Agent that can handle these tasks "sequentially" using taskgroups - in a manner of WORKFLOW iykyk
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
             # See all available models at https://docs.livekit.io/agents/models/llm/
-            llm=inference.LLM(model="openai/gpt-5.2-chat-latest"),
+            llm=inference.LLM(model="openai/gpt-4.1-mini"),
             # To use a realtime model instead of a voice pipeline, replace the LLM
             # with a RealtimeModel and remove the STT/TTS from the AgentSession
             # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/)
@@ -139,31 +204,77 @@ class Assistant(Agent):
             ),
         )
         
-    @function_tool
-    async def on_entry(self,email: str) -> None:
-        task_group = TaskGroup()
-        
-        task_group.add( 
-            lambda: GetEmail(),
-            id = "email",
-            description="Collecting the user's email address."
-        )
-        task_group.add(
-            lambda: GetShippingAdress(),
-            id= "address",
-            description="Collecting the user's shipping address."
+    async def on_enter(self) -> None:
+        #seeking consent approval before going onto the tasks.
+        consent = await ConsentApproval(
+            chat_ctx=self.chat_ctx.copy(exclude_instructions=True) #gets a copy of the context data to another agent without the user turn messages.
         )
         
-        results = await task_group
+        if consent:
+            await self.session.generate_reply(
+                instructions="""
+                    Thank them for their cooperation.
+                """
+            )
+        else:
+            await self.session.generate_reply(
+                instructions="""
+                    Proceed the call without recording.
+                """
+            )
         
-        #extracting the results:
-        email_address = results.task_results["email"].email
-        shipping_address = results.task_results["address"].address
-        
-        await self.session.generate_reply(
-            instructions=f"Confirm the email as {email_address} and the shipping address as {shipping_address}"
-        )
+        async def print_task_result(event: TaskCompletedEvent) -> None:
+            logger.info(
+                "Task '%s' completed with result: %s",
+                event.task_id,
+                event.result,
+            )
+            
 
+        while True:
+            task_group = TaskGroup(
+                chat_ctx=self.chat_ctx.copy(exclude_instructions=True),
+                on_task_completed=print_task_result,
+            )
+            
+            task_group.add( 
+                lambda: GetEmail(),
+                id="email_address",
+                description="Collects the email address.",
+            )
+            task_group.add(
+                lambda: GetShippingAddress(),
+                id="shipping_address",
+                description="Collects the shipping address.",
+            )
+            
+            results = await task_group
+
+            email_address = results.task_results["email_address"].email
+            shipping_address = results.task_results["shipping_address"].address
+
+            confirmation = await ConfirmContactInfo(
+                email_address,
+                shipping_address,
+                chat_ctx=self.chat_ctx.copy(exclude_instructions=True),
+            )
+
+            if confirmation.confirmed:
+                await self.session.generate_reply(
+                    instructions="""
+                        Thank the user and confirm that the details are recorded.
+                    """
+                )
+                break
+
+            await self.session.generate_reply(
+                instructions="""
+                    No problem. Let's update your details.
+                """
+            )
+
+        task_results = results.task_results
+        return task_results
 
 server = AgentServer()
 
@@ -188,6 +299,7 @@ async def my_agent(ctx: JobContext):
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=inference.STT(model="deepgram/nova-3", language="multi"),
+        llm=inference.LLM(model="openai/gpt-4.1-mini"),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=inference.TTS(
